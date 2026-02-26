@@ -1,0 +1,852 @@
+#include "xparameters.h"
+#include "stdio.h"
+#include "xil_exception.h"
+#include "unistd.h"
+
+#include "xuartps.h"	// if PS uart is used
+#include "xscutimer.h"  // if PS Timer is used
+#include "xdmaps.h"		// if PS DMA is used
+#include "xscugic.h" 	// if PS GIC is used
+#include "xil_exception.h"	// if interrupt is used
+#include "xil_printf.h"
+
+#include "xtime_l.h"
+#include "weights_gru.h"
+#include "weights_lstm.h"
+#include "rr_signal_1000.h"
+#include "rr_symbol_1000.h"
+
+#define RESET_LOOP_COUNT	10	// Number of times to check reset is done
+#define LENGTH 8192 // source and destination buffers lengths in number of words
+
+#define OCM_MEMORY XPAR_PS7_OCMC_0_S_AXI_BASEADDR
+#define BRAM_MEMORY0 XPAR_AXI_BRAM_CTRL_0_S_AXI_BASEADDR
+#define BRAM_MEMORY1 XPAR_AXI_BRAM_CTRL_1_S_AXI_BASEADDR
+#define DDR_MEMORY XPAR_PS7_DDR_0_S_AXI_BASEADDR+0x00020000 // pass all code and data sections
+
+#define TIMER_DEVICE_ID	XPAR_SCUTIMER_DEVICE_ID
+#define TIMER_LOAD_VALUE 0xFFFFFFFF
+#define DMA0_ID XPAR_XDMAPS_1_DEVICE_ID
+#define INTC_DEVICE_INT_ID XPAR_SCUGIC_SINGLE_DEVICE_ID
+
+// ecg defines
+#define T 8
+#define IN 32
+#define DIM (T*IN)
+
+#define GRU_H 128
+#define LSTM_H 128
+
+#define NUM_CLASSES 5
+// ecg defines
+
+volatile static int Done = 0;	/* Dma transfer is done */
+volatile static int Error = 0;	/* Dma Bus Error occurs */
+
+int debug_flag = 1;		// 1 to print debug message, 0 ffor silent mode (profiling)
+
+XUartPs Uart_PS;		/* Instance of the UART Device */
+XScuTimer Timer;		/* Cortex A9 SCU Private Timer Instance */
+XDmaPs Dma;				/* PS DMA */
+XScuGic Gic;			/* PS GIC */
+
+XScuTimer_Config *ConfigPtr;
+XScuTimer *TimerInstancePtr = &Timer;
+
+// PS Interrupt related definitions
+XScuGic_Config *GicConfig;
+
+XDmaPs_Config *DmaCfg;
+
+
+//int DmaPs_Start(XDmaPs *InstPtr, unsigned int Channel,
+//		  XDmaPs_Cmd *Cmd,
+//		  int HoldDmaProg);
+
+void DmaDoneHandler(unsigned int Channel,
+		    XDmaPs_Cmd *DmaCmd,
+		    void *CallbackRef)
+{
+	/* done handler */
+  	Done = 1;
+}
+
+void DmaFaultHandler(unsigned int Channel,
+		     XDmaPs_Cmd *DmaCmd,
+		     void *CallbackRef)
+{
+	/* fault handler */
+
+	Error = 1;
+}
+
+
+
+
+
+// ------------------------------------------------------------
+// Small math helpers (no extra .c/.h files)
+// ------------------------------------------------------------
+static inline float clampf(float x, float lo, float hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+// exp approximation (used when USE_MATH_H=0)
+static inline float expf_approx(float x) {
+#if USE_MATH_H
+    return expf(x);
+#else
+    // Clamp to avoid overflow
+    x = clampf(x, -80.0f, 80.0f);
+
+    // e^x = 2^(x / ln2)
+    const float inv_ln2 = 1.44269504088896341f; // 1/ln(2)
+    const float ln2     = 0.6931471805599453f;
+
+    float y = x * inv_ln2;
+    int n = (int)(y);
+    float f = y - (float)n;
+
+
+    float p = 1.0f
+            + f * ln2
+            + (f*f) * (ln2*ln2*0.5f)
+            + (f*f*f) * (ln2*ln2*ln2*(1.0f/6.0f));
+
+    // scale by 2^n using exponent bits
+    int exp = n + 127;
+    if (exp <= 0) return 0.0f;
+    if (exp >= 255) return 3.402823466e+38f; // FLT_MAX
+    union { uint32_t i; float f; } u;
+    u.i = (uint32_t)(exp << 23);
+    return u.f * p;
+#endif
+}
+
+static inline float sigmoidf(float x) {
+    x = clampf(x, -20.0f, 20.0f);
+#if USE_MATH_H
+    return 1.0f / (1.0f + expf(-x));
+#else
+    float e = expf_approx(-x);
+    return 1.0f / (1.0f + e);
+#endif
+}
+
+static inline float tanhf_approx(float x) {
+#if USE_MATH_H
+    return tanhf(x);
+#else
+    // tanh(x) = 2*sigmoid(2x) - 1
+    float s = sigmoidf(2.0f * x);
+    return 2.0f * s - 1.0f;
+#endif
+}
+
+static void softmax5(const float logits[NUM_CLASSES], float prob[NUM_CLASSES]) {
+    float m = logits[0];
+    for (int i = 1; i < NUM_CLASSES; ++i) if (logits[i] > m) m = logits[i];
+
+    float sum = 0.0f;
+    for (int i = 0; i < NUM_CLASSES; ++i) {
+        float e = expf_approx(logits[i] - m);
+        prob[i] = e;
+        sum += e;
+    }
+    if (sum <= 0.0f) {
+        for (int i = 0; i < NUM_CLASSES; ++i) prob[i] = 1.0f / (float)NUM_CLASSES;
+        return;
+    }
+    float inv = 1.0f / sum;
+    for (int i = 0; i < NUM_CLASSES; ++i) prob[i] *= inv;
+}
+
+static int argmax5(const float prob[NUM_CLASSES]) {
+    int best = 0;
+    float m = prob[0];
+    for (int i = 1; i < NUM_CLASSES; ++i) {
+        if (prob[i] > m) { m = prob[i]; best = i; }
+    }
+    return best;
+}
+
+
+
+// ------------------------------------------------------------
+// Small math helpers (no extra .c/.h files)
+// ------------------------------------------------------------
+
+static void ecg_gru(const float *x256, float out_prob[NUM_CLASSES]) {
+    float h[GRU_H] = {0};
+
+    for (int t = 0; t < T; ++t) {
+        float z[GRU_H];
+        float r[GRU_H];
+
+        // 1) gates z and r
+        for (int u = 0; u < GRU_H; ++u) {
+            float zpre = gru_bias[u];
+            float rpre = gru_bias[GRU_H + u];
+
+            const float *xt = x256 + t*IN;
+            for (int k = 0; k < IN; ++k) {
+                float xv = xt[k];
+                zpre += xv * gru_kernel[k][u];
+                rpre += xv * gru_kernel[k][GRU_H + u];
+            }
+
+            float hz = 0.0f, hr = 0.0f;
+            for (int k = 0; k < GRU_H; ++k) {
+                float hv = h[k];
+                hz += hv * gru_recurrent_kernel[k][u];
+                hr += hv * gru_recurrent_kernel[k][GRU_H + u];
+            }
+
+            z[u] = sigmoidf(zpre + hz);
+            r[u] = sigmoidf(rpre + hr);
+        }
+
+        // 2) candidate h_tilde
+        float h_tilde[GRU_H];
+        for (int u = 0; u < GRU_H; ++u) {
+            float hpre = gru_bias[2*GRU_H + u];
+
+            const float *xt = x256 + t*IN;
+            for (int k = 0; k < IN; ++k) {
+                float xv = xt[k];
+                hpre += xv * gru_kernel[k][2*GRU_H + u];
+            }
+
+            float hh = 0.0f;
+            for (int k = 0; k < GRU_H; ++k) {
+                float hv = h[k] * r[k];
+                hh += hv * gru_recurrent_kernel[k][2*GRU_H + u];
+            }
+
+            h_tilde[u] = tanhf_approx(hpre + hh);
+        }
+
+        // 3) update h
+        for (int u = 0; u < GRU_H; ++u) {
+            float zu = z[u];
+            h[u] = zu * h[u] + (1.0f - zu) * h_tilde[u];
+        }
+    }
+
+    // Dense(128->5) + softmax
+    float logits[NUM_CLASSES];
+    for (int j = 0; j < NUM_CLASSES; ++j) {
+        float acc = gru_dense_b[j];
+        for (int i = 0; i < GRU_H; ++i) acc += h[i] * gru_dense_W[i][j];
+        logits[j] = acc;
+    }
+    softmax5(logits, out_prob);
+}
+
+
+
+
+
+static void ecg_lstm(const float *x256, float out_prob[NUM_CLASSES]) {
+    float h[LSTM_H] = {0};
+    float c[LSTM_H] = {0};
+
+    for (int t = 0; t < T; ++t) {
+        float i_gate[LSTM_H];
+        float f_gate[LSTM_H];
+        float c_bar[LSTM_H];
+        float o_gate[LSTM_H];
+
+        for (int u = 0; u < LSTM_H; ++u) {
+            float ipre = lstm_bias[u];
+            float fpre = lstm_bias[LSTM_H + u];
+            float cpre = lstm_bias[2*LSTM_H + u];
+            float opre = lstm_bias[3*LSTM_H + u];
+
+            const float *xt = x256 + t*IN;
+            for (int k = 0; k < IN; ++k) {
+                float xv = xt[k];
+                ipre += xv * lstm_kernel[k][u];
+                fpre += xv * lstm_kernel[k][LSTM_H + u];
+                cpre += xv * lstm_kernel[k][2*LSTM_H + u];
+                opre += xv * lstm_kernel[k][3*LSTM_H + u];
+            }
+
+            float hi = 0.0f, hf = 0.0f, hc = 0.0f, ho = 0.0f;
+            for (int k = 0; k < LSTM_H; ++k) {
+                float hv = h[k];
+                hi += hv * lstm_recurrent_kernel[k][u];
+                hf += hv * lstm_recurrent_kernel[k][LSTM_H + u];
+                hc += hv * lstm_recurrent_kernel[k][2*LSTM_H + u];
+                ho += hv * lstm_recurrent_kernel[k][3*LSTM_H + u];
+            }
+
+            i_gate[u] = sigmoidf(ipre + hi);
+            f_gate[u] = sigmoidf(fpre + hf);
+            c_bar[u]  = tanhf_approx(cpre + hc);
+            o_gate[u] = sigmoidf(opre + ho);
+        }
+
+        for (int u = 0; u < LSTM_H; ++u) {
+            c[u] = f_gate[u] * c[u] + i_gate[u] * c_bar[u];
+            h[u] = o_gate[u] * tanhf_approx(c[u]);
+        }
+    }
+
+    // Dense1 (128->128) ReLU
+    float d1[128];
+    for (int j = 0; j < 128; ++j) {
+        float acc = lstm_dense1_b[j];
+        for (int i = 0; i < 128; ++i) acc += h[i] * lstm_dense1_W[i][j];
+        d1[j] = (acc > 0.0f) ? acc : 0.0f;
+    }
+
+    // Dense2 (128->5) + softmax
+    float logits[NUM_CLASSES];
+    for (int j = 0; j < NUM_CLASSES; ++j) {
+        float acc = lstm_dense2_b[j];
+        for (int i = 0; i < 128; ++i) acc += d1[i] * lstm_dense2_W[i][j];
+        logits[j] = acc;
+    }
+    softmax5(logits, out_prob);
+}
+
+
+
+
+static void print_confusion(const int cm[NUM_CLASSES][NUM_CLASSES], const char *title) {
+    printf("\n %s confusion matrix:\n", title);
+    printf("\n%s confusion matrix:\n", title);
+    for (int i = 0; i < NUM_CLASSES; ++i) {
+        printf(" [");
+        for (int j = 0; j < NUM_CLASSES; ++j) {
+            printf("%6d", cm[i][j]);
+            if (j != NUM_CLASSES-1) printf(" ");
+        }
+        printf("]\n");
+    }
+}
+
+
+
+void ecg_lstm_and_gru() {
+
+    int correct_gru = 0, correct_lstm = 0, agree = 0;
+    int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
+    int cm_lstm[NUM_CLASSES][NUM_CLASSES] = {{0}};
+    XTime start_gru, start_lstm, end_gru, end_lstm;
+
+    int t_gru,t_lstm;
+    for (int n = 0; n < RR_N; ++n) {
+        const float *x = rr_signal[n];  // 256 floats
+        int yt = (int)rr_label[n];      // 0..4
+
+        float p_gru[NUM_CLASSES], p_lstm[NUM_CLASSES];
+        XTime_GetTime(&start_gru);
+        ecg_gru(x, p_gru);
+        XTime_GetTime(&end_gru);
+
+
+        XTime_GetTime(&start_lstm);
+        ecg_lstm(x, p_lstm);
+        XTime_GetTime(&end_lstm);
+
+        printf("gru time: %d \n",start_gru-t_gru);
+        printf("lstm time: %d \n",start_lstm-t_lstm);
+        int pred_gru  = argmax5(p_gru);
+        int pred_lstm = argmax5(p_lstm);
+
+        if (pred_gru == yt) correct_gru++;
+        if (pred_lstm == yt) correct_lstm++;
+        if (pred_gru == pred_lstm) agree++;
+
+        cm_gru[yt][pred_gru]  += 1;
+        cm_lstm[yt][pred_lstm] += 1;
+
+        // Optional progress print (reduce if UART is slow)
+        if ((n % 200) == 0) {
+            printf("n=%d/%d\r", n, RR_N);
+        }
+    }
+    printf("\n");
+
+    float acc_gru  = (float)correct_gru  / (float)RR_N;
+    float acc_lstm = (float)correct_lstm / (float)RR_N;
+    float agr      = (float)agree        / (float)RR_N;
+
+    // xil_printf doesn't support %f reliably on some BSPs.
+    // Print as fixed-point (x10000) to be safe.
+    int acc_gru_x1e4  = (int)(acc_gru  * 10000.0f + 0.5f);
+    int acc_lstm_x1e4 = (int)(acc_lstm * 10000.0f + 0.5f);
+    int agr_x1e4      = (int)(agr      * 10000.0f + 0.5f);
+
+    printf("GRU acc : %d.%04d\n",  acc_gru_x1e4/10000,  acc_gru_x1e4%10000);
+    printf("LSTM acc: %d.%04d\n", acc_lstm_x1e4/10000, acc_lstm_x1e4%10000);
+    printf("Agreement: %d.%04d\n", agr_x1e4/10000,      agr_x1e4%10000);
+
+    print_confusion(cm_gru, "GRU");
+    print_confusion(cm_lstm, "LSTM");
+
+
+
+}
+
+
+void fourbyfour_sw(const uint64_t *in_u64, uint64_t *out_u64, int n_in) {
+    // 4 條各自的 16 級移位暫存器
+    int16_t a[4][16] = {0};
+    int out_idx = 0;
+	int8_t c[4][16];
+	int8_t temp = 1;
+	for(int i = 0;i<4;i++){
+		for(int j = 0;j<16;j++){
+
+			c[i][j] = temp;
+			temp++;
+		}
+	}
+    for (int k = 0; k < n_in; ++k) {
+    	//w = {a0,a1,a2,a3}
+        uint64_t w = in_u64[k];
+        int16_t a0 = (int16_t)(w >> 48);
+        int16_t a1 = (int16_t)(w >> 32);
+        int16_t a2 = (int16_t)(w >> 16);
+        int16_t a3 = (int16_t)(w >>  0);
+
+        // shift reg
+        for (int t = 15; t > 0; --t) {
+            a[0][t] = a[0][t-1];
+            a[1][t] = a[1][t-1];
+            a[2][t] = a[2][t-1];
+            a[3][t] = a[3][t-1];
+        }
+        a[0][0] = a0; a[1][0] = a1; a[2][0] = a2; a[3][0] = a3;
+
+
+        int16_t mac[16] = {0};
+
+        for (int p = 0; p < 16; ++p) {
+            mac[0] += (a[0][p] * c[0][15-p]);//1~16
+            mac[1] += a[1][p] * c[0][15-p];
+            mac[2] += a[2][p] * c[0][15-p];
+            mac[3] += a[3][p] * c[0][15-p];
+
+            mac[4] += a[0][p] * c[1][15-p];//17~32
+            mac[5] += a[1][p] * c[1][15-p];
+            mac[6] += a[2][p] * c[1][15-p];
+            mac[7] += a[3][p] * c[1][15-p];
+
+            mac[8] += a[0][p] * c[2][15-p];//33~48
+            mac[9] += a[1][p] * c[2][15-p];
+            mac[10] += a[2][p]* c[2][15-p];
+            mac[11] += a[3][p]* c[2][15-p];
+
+            mac[12] += a[0][p]* c[3][15-p];//49~64
+            mac[13] += a[1][p]* c[3][15-p];
+            mac[14] += a[2][p]* c[3][15-p];
+            mac[15] += a[3][p]* c[3][15-p];
+        }
+
+        // shift 4
+        int16_t o0 = (mac[0] + mac[1] + mac[2] + mac[3])>>4;
+        int16_t o1 = (mac[4] + mac[5] + mac[6] + mac[7])>>4;
+        int16_t o2 = (mac[8] + mac[9] + mac[10] + mac[11])>>4;
+        int16_t o3 = (mac[12] + mac[13] + mac[14] + mac[15])>>4;
+
+
+        // out = {out0,out1,out2,out3}
+        uint64_t pack =
+            ((uint64_t)(uint16_t)o0 << 48) |
+            ((uint64_t)(uint16_t)o1 << 32) |
+            ((uint64_t)(uint16_t)o2 << 16) |
+            ((uint64_t)(uint16_t)o3 <<  0);
+
+        out_u64[out_idx++] = pack;
+    }
+}
+
+
+
+
+
+int SetupIntrSystem(XScuGic *GicPtr, XDmaPs *DmaPtr)
+{
+	int Status;
+
+	Xil_ExceptionInit();
+
+	// Connect the interrupt controller interrupt handler to the hardware
+	// interrupt handling logic in the processor.
+	Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_IRQ_INT,
+			     (Xil_ExceptionHandler)XScuGic_InterruptHandler,
+			     GicPtr);
+
+	// Connect a device driver handler that will be called when an interrupt
+	// for the device occurs, the device driver handler performs the specific
+	// interrupt processing for the device
+
+	// Connect the Fault ISR
+	Status = XScuGic_Connect(GicPtr,
+				 XPAR_XDMAPS_0_FAULT_INTR,
+				 (Xil_InterruptHandler)XDmaPs_FaultISR,
+				 (void *)DmaPtr);
+	if (Status != XST_SUCCESS)
+		return XST_FAILURE;
+
+	// Connect the Done ISR for channel 0 of DMA 0
+	Status = XScuGic_Connect(GicPtr,
+				 XPAR_XDMAPS_0_DONE_INTR_0,
+				 (Xil_InterruptHandler)XDmaPs_DoneISR_0,
+				 (void *)DmaPtr);
+
+	if (Status != XST_SUCCESS)
+		return XST_FAILURE;
+
+	// Enable the interrupt for the device
+	XScuGic_Enable(GicPtr, XPAR_XDMAPS_0_DONE_INTR_0);
+
+	return XST_SUCCESS;
+}
+
+int MoveDataCPU(u32 * source, u32 * destination, int num) {
+	volatile u32 CntValue1;
+    int i;
+
+	// reset timer
+	XScuTimer_RestartTimer(TimerInstancePtr);
+
+	// start moving data through the processor - no CDMA, no interrupt
+	// gives base consumed cycles
+	for (i=0; i<num; i++)
+		*(destination+i) = *(source+i);
+
+	CntValue1 = XScuTimer_GetCounterValue(TimerInstancePtr);
+
+	return CntValue1;
+}
+
+
+int MoveDataDMA64(u64 * source, u64 * destination, int num) {
+    int Status;
+	volatile u32 CntValue1;
+
+	// PS DMA related definitions
+	// reset timer
+	XScuTimer_RestartTimer(TimerInstancePtr);
+
+	XDmaPs_Cmd DmaCmd = {
+		.ChanCtrl = {
+			.SrcBurstSize = 4,
+			.SrcBurstLen = 4,
+			.SrcInc = 1,		// increment source address
+			.DstBurstSize = 4,
+			.DstBurstLen = 4,
+			.DstInc = 1,		// increment destination address
+		},
+	};
+	unsigned int Channel = 0;
+
+
+	// Setup DMA Controller
+	DmaCfg = XDmaPs_LookupConfig(DMA0_ID);
+	if (!DmaCfg) {
+		//xil_printf("Lookup DMAC %d failed\r\n", DMA0_ID);
+		return XST_FAILURE;
+	}
+
+	Status = XDmaPs_CfgInitialize(&Dma,DmaCfg,DmaCfg->BaseAddress);
+
+	if (Status) {
+		//xil_printf("XDmaPs_CfgInitialize failed\r\n");
+		return XST_FAILURE;
+	}
+
+	// DMA in polling mode
+//		print("Starting transfer through DMA in poll mode\r\n");
+		DmaCmd.BD.SrcAddr = (u32)source;
+		DmaCmd.BD.DstAddr = (u32)destination;
+		DmaCmd.BD.Length = num * sizeof(u64);
+
+	// setting up for interrupt driven DMA
+
+
+		if (debug_flag)
+			//print("Setting up interrupt system\r\n");
+
+		Status = SetupIntrSystem(&Gic, &Dma);
+		if (Status != XST_SUCCESS) {
+			return XST_FAILURE;
+		}
+
+		Xil_ExceptionEnableMask(XIL_EXCEPTION_IRQ);
+
+		XDmaPs_SetDoneHandler(&Dma,0,DmaDoneHandler,0);
+		Status = XDmaPs_Start(&Dma, Channel, &DmaCmd, 0);	// release DMA buffer as we are done
+
+
+
+		while ((Done==0) & (Error==0));
+
+		if (Error)
+			//print("Error occurred during DMA transfer\r\n");
+
+		CntValue1 = XScuTimer_GetCounterValue(TimerInstancePtr);
+
+		if (debug_flag)
+			//print("Transfer complete\r\n");
+		// Disable the interrupt for the device
+		XScuGic_Disable(&Gic, XPAR_XDMAPS_0_DONE_INTR_0);
+
+		Error = 0;
+		Done = 0;
+		return TIMER_LOAD_VALUE - CntValue1;
+}
+
+
+
+int MoveDataDMA32(u32 * source, u32 * destination, int num) {
+    int Status;
+	volatile u32 CntValue1;
+
+	// PS DMA related definitions
+
+	XDmaPs_Cmd DmaCmd = {
+		.ChanCtrl = {
+			.SrcBurstSize = 4,
+			.SrcBurstLen = 4,
+			.SrcInc = 1,		// increment source address
+			.DstBurstSize = 4,
+			.DstBurstLen = 4,
+			.DstInc = 1,		// increment destination address
+		},
+	};
+	unsigned int Channel = 0;
+
+
+	// Setup DMA Controller
+	DmaCfg = XDmaPs_LookupConfig(DMA0_ID);
+	if (!DmaCfg) {
+		xil_printf("Lookup DMAC %d failed\r\n", DMA0_ID);
+		return XST_FAILURE;
+	}
+
+	Status = XDmaPs_CfgInitialize(&Dma,DmaCfg,DmaCfg->BaseAddress);
+
+	if (Status) {
+		xil_printf("XDmaPs_CfgInitialize failed\r\n");
+		return XST_FAILURE;
+	}
+
+	// DMA in polling mode
+//		print("Starting transfer through DMA in poll mode\r\n");
+		DmaCmd.BD.SrcAddr = (u32)source;
+		DmaCmd.BD.DstAddr = (u32)destination;
+		DmaCmd.BD.Length = num * sizeof(u32);
+
+	// setting up for interrupt driven DMA
+
+
+		if (debug_flag)
+			print("Setting up interrupt system\r\n");
+
+		Status = SetupIntrSystem(&Gic, &Dma);
+		if (Status != XST_SUCCESS) {
+			return XST_FAILURE;
+		}
+
+		Xil_ExceptionEnableMask(XIL_EXCEPTION_IRQ);
+
+		XDmaPs_SetDoneHandler(&Dma,0,DmaDoneHandler,0);
+		Status = XDmaPs_Start(&Dma, Channel, &DmaCmd, 0);	// release DMA buffer as we are done
+
+		// reset timer
+		XScuTimer_RestartTimer(TimerInstancePtr);
+
+		while ((Done==0) & (Error==0));
+
+		if (Error)
+			print("Error occurred during DMA transfer\r\n");
+
+		CntValue1 = XScuTimer_GetCounterValue(TimerInstancePtr);
+
+		if (debug_flag)
+			print("Transfer complete\r\n");
+		// Disable the interrupt for the device
+		XScuGic_Disable(&Gic, XPAR_XDMAPS_0_DONE_INTR_0);
+
+		Error = 0;
+		Done = 0;
+		return CntValue1;
+}
+
+
+int main (void) {
+
+	// UART related definitions
+    int Status;
+	XUartPs_Config *Config;
+
+	// Initialize UART
+	// Look up the configuration in the config table, then initialize it.
+	Config = XUartPs_LookupConfig(XPAR_XUARTPS_0_DEVICE_ID);
+	if (NULL == Config) {
+		return XST_FAILURE;
+	}
+
+	Status = XUartPs_CfgInitialize(&Uart_PS, Config, Config->BaseAddress);
+	if (Status != XST_SUCCESS) {
+		return XST_FAILURE;
+	}
+
+	// Initialize timer counter
+	ConfigPtr = XScuTimer_LookupConfig(TIMER_DEVICE_ID);
+
+	Status = XScuTimer_CfgInitialize(TimerInstancePtr, ConfigPtr,
+				 ConfigPtr->BaseAddr);
+	if (Status != XST_SUCCESS) {
+		return XST_FAILURE;
+	}
+
+	// Initialize GIC
+	GicConfig = XScuGic_LookupConfig(INTC_DEVICE_INT_ID);
+	if (NULL == GicConfig) {
+		xil_printf("XScuGic_LookupConfig(%d) failed\r\n",
+				INTC_DEVICE_INT_ID);
+		return XST_FAILURE;
+	}
+
+	Status = XScuGic_CfgInitialize(&Gic, GicConfig,
+				       GicConfig->CpuBaseAddress);
+	if (Status != XST_SUCCESS) {
+		xil_printf("XScuGic_CfgInitialize failed\r\n");
+		return XST_FAILURE;
+	}
+
+	// Set options for timer/counter 0
+	// Load the timer counter register.
+	XScuTimer_LoadTimer(TimerInstancePtr, TIMER_LOAD_VALUE);
+
+	// Start the Scu Private Timer device.
+	XScuTimer_Start(TimerInstancePtr);
+
+
+	if (debug_flag)
+		print("-- Memory Copy Performance test --\r\n");
+
+
+	// Number of words you want to transfer: between 1 and 8192
+
+	u64 *inputa;
+	u64 *HardwareOutput;
+	u64 *SoftwareOutput;
+	int input_num = 32;
+	inputa = (u64 *) DDR_MEMORY + 0x00010000;
+	HardwareOutput = (u64 *) inputa + (sizeof(u64)*input_num);
+	SoftwareOutput = (u64 *) HardwareOutput + (sizeof(u64)*input_num);
+
+
+	u64 *bram_a_destination;
+	u64 *bram_out0_destination;
+	bram_a_destination = (u64 *) BRAM_MEMORY0;
+	bram_out0_destination = (u64 *) BRAM_MEMORY1;
+
+	unsigned long long temp = 1;
+	unsigned long long one = 1;
+
+    for ( int i = 1 ; i <= input_num ; i++ ){
+    	unsigned long long cur_number = temp;
+    	for ( int four = 0 ; four < 4 ; four++){
+    		cur_number = cur_number << 16;
+    		cur_number = cur_number + temp;
+    	}
+    	temp = temp + one;
+    	inputa[i-1] = cur_number;
+    }
+
+
+    XTime t0, t1, t2, t3, t4;
+    int sw_done = 0;
+    int repeat = 650;
+
+
+
+    Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000004) ; // rst = 1
+    Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000002) ; // data_in_st = 1
+    XTime_GetTime(&t0);
+
+    int dma_tick1 = MoveDataDMA64(inputa, bram_a_destination, input_num);
+    XTime_GetTime(&t1);
+
+
+
+	Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR + 8, repeat);
+	Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000001) ; // op_st = 1
+
+	while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 4) == 0) {
+		if (!sw_done) {
+			fourbyfour_sw(inputa, SoftwareOutput, 32);
+
+			sw_done = 1;   // 只算一次（或拆小塊多次算）
+		}
+	}
+	Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000000) ; // slv_reg0 = 0(no operation)
+
+
+    XTime_GetTime(&t2);
+    //fourbyfour_sw(inputa, SoftwareOutput, 32);
+    int output_num = input_num -15;
+    XTime_GetTime(&t3);
+    int dma_tick2 = MoveDataDMA64(bram_out0_destination, HardwareOutput, output_num) ;
+    XTime_GetTime(&t4);
+
+
+
+
+    for( int i = 0 ; i < output_num ; i++) {
+    	printf("Hard outputMK2[%d] = %llu\n", i, HardwareOutput[i]);
+    } // for
+    for( int i = 15 ; i < input_num ; i++) {
+    	printf("Soft outputMK2[%d] = %llu\n", i-15, SoftwareOutput[i]);
+    } // for
+    //******************time********************
+    const u64 gticks1 = t1 - t0;
+    const u64 us1     = (gticks1 * 1000000ULL) / COUNTS_PER_SECOND;
+    const u64 cycles1 = us1 * 50ULL;
+
+    const u64 gticks2 = t2 - t1;
+    const u64 us2     = (gticks2 * 1000000ULL) / COUNTS_PER_SECOND;
+    const u64 cycles2 = us2 * 50ULL;
+
+
+    const u64 gticks3 = t3 - t2;
+    const u64 us3     = (gticks3 * 1000000ULL) / COUNTS_PER_SECOND;
+    const u64 cycles3 = us3 * 50ULL;                                  // 20ns/clk → 50 cycles/us
+
+    const u64 gticks4 = t4 - t3;
+    const u64 us4     = (gticks4 * 1000000ULL) / COUNTS_PER_SECOND;
+    const u64 cycles4 = us4 * 50ULL;
+
+    const u64 gticks5 = t4 - t0;
+    const u64 us5     = (gticks5 * 1000000ULL) / COUNTS_PER_SECOND;
+    const u64 cycles5 = us5 * 50ULL;
+
+
+    double dma_us1 = (double)dma_tick1 * 1e6 / (double)XPAR_XUARTPS_0_UART_CLK_FREQ_HZ;
+    double dma_cycles_50_1 = dma_us1 * 50.0;
+
+    double dma_us2 = (double)dma_tick2 * 1e6 / (double)XPAR_XUARTPS_0_UART_CLK_FREQ_HZ;
+    double dma_cycles_50_2 = dma_us2 * 50.0;
+    //printf("first DMA time: ~%.0f cycles @50MHz (~%.2f us, %d ticks)\n", dma_cycles_50_1, dma_us1, dma_tick1);
+    //printf("first DMA time(DMA counter):%d ticks\n",dma_tick1);
+    printf("first DMA time(Xtime):%llu us\n",us1);
+    printf("(%d rounds) hardware compute time: %llu cycles (~%llu us)\n",repeat, cycles2, us2);
+    printf("software compute time: %llu cycles (~%llu us)\n", cycles3, us3);
+    //printf("second DMA time: ~%.0f cycles @50MHz (~%.2f us, %d ticks)\n", dma_cycles_50_2, dma_us2, dma_tick2);
+    //printf("second DMA time(DMA counter):%d ticks\n",dma_tick2);
+    printf("second DMA time(Xtime):%llu us\n",us4);
+    printf("total time: %llu cycles (~%llu us)\n", cycles5, us5);
+    ecg_lstm_and_gru();
+    return 0;
+} // main()

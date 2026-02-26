@@ -336,30 +336,85 @@ void ecg_lstm_and_gru() {
     int correct_gru = 0, correct_lstm = 0, agree = 0;
     int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
     int cm_lstm[NUM_CLASSES][NUM_CLASSES] = {{0}};
+    XTime start_gru, start_lstm, end_gru, end_lstm;
 
+    u64 t_gru = 0;
+    u64 t_lstm = 0;
+
+
+
+    // *********** GRU loop ************
+    printf("start GRU\n");
+    XTime_GetTime(&start_gru);
     for (int n = 0; n < RR_N; ++n) {
         const float *x = rr_signal[n];  // 256 floats
         int yt = (int)rr_label[n];      // 0..4
 
-        float p_gru[NUM_CLASSES], p_lstm[NUM_CLASSES];
+        float p_gru[NUM_CLASSES];
+
+
         ecg_gru(x, p_gru);
-        ecg_lstm(x, p_lstm);
+
+
+
+
 
         int pred_gru  = argmax5(p_gru);
-        int pred_lstm = argmax5(p_lstm);
+
 
         if (pred_gru == yt) correct_gru++;
-        if (pred_lstm == yt) correct_lstm++;
-        if (pred_gru == pred_lstm) agree++;
+
+
 
         cm_gru[yt][pred_gru]  += 1;
+
+
+        // Optional progress print (reduce if UART is slow)
+        if ((n % 200) == 0) {
+            printf("n=%d/%d\r", n, RR_N);
+
+        }
+    }
+    XTime_GetTime(&end_gru);
+    t_gru = (end_gru - start_gru);
+    printf("gru time: %llu \n", t_gru);
+    printf("GRU seconds=%.6f\r\n", (double)t_gru / (double)COUNTS_PER_SECOND);
+    // *********** GRU loop ************
+
+
+    // *********** LSTM loop ************
+    printf("start LSTM\n");
+    XTime_GetTime(&start_lstm);
+    for (int n = 0; n < RR_N; ++n) {
+        const float *x = rr_signal[n];  // 256 floats
+        int yt = (int)rr_label[n];      // 0..4
+
+        float p_lstm[NUM_CLASSES];
+
+
+
+        ecg_lstm(x, p_lstm);
+
+
+        int pred_lstm = argmax5(p_lstm);
+
+        if (pred_lstm == yt) correct_lstm++;
+
+
+
         cm_lstm[yt][pred_lstm] += 1;
 
         // Optional progress print (reduce if UART is slow)
         if ((n % 200) == 0) {
             printf("n=%d/%d\r", n, RR_N);
+
         }
     }
+    XTime_GetTime(&end_lstm);
+    t_lstm = (end_lstm - start_lstm);
+    printf("lstm time: %llu \n", t_lstm);
+    printf("LSTM seconds=%.6f\r\n", (double)t_lstm / (double)COUNTS_PER_SECOND);
+    // *********** LSTM loop ************
     printf("\n");
 
     float acc_gru  = (float)correct_gru  / (float)RR_N;
