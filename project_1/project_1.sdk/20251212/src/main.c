@@ -333,106 +333,84 @@ static void print_confusion(const int cm[NUM_CLASSES][NUM_CLASSES], const char *
 
 void ecg_lstm_and_gru() {
 
-    int correct_gru = 0, correct_lstm = 0, agree = 0;
+    int correct_gru = 0;
     int cm_gru[NUM_CLASSES][NUM_CLASSES] = {{0}};
-    int cm_lstm[NUM_CLASSES][NUM_CLASSES] = {{0}};
-    XTime start_gru, start_lstm, end_gru, end_lstm;
 
+    XTime start_gru, end_gru;
+    XTime start_para_time, start_argmax_time;
+    XTime end_para_time, end_argmax_time;
     u64 t_gru = 0;
-    u64 t_lstm = 0;
+    u64 t_para = 0;
+    u64 t_argmax = 0;
 
-
+    int samples_count = 50;
 
     // *********** GRU loop ************
     printf("start GRU\n");
     XTime_GetTime(&start_gru);
-    for (int n = 0; n < RR_N; ++n) {
+    for (int n = 0; n < samples_count; ++n) {
+
+        XTime_GetTime(&start_para_time);
         const float *x = rr_signal[n];  // 256 floats
         int yt = (int)rr_label[n];      // 0..4
-
         float p_gru[NUM_CLASSES];
 
+        XTime_GetTime(&end_para_time);
 
+
+        XTime_GetTime(&start_gru);
         ecg_gru(x, p_gru);
+        XTime_GetTime(&end_gru);
 
-
-
-
-
+        XTime_GetTime(&start_argmax_time);
         int pred_gru  = argmax5(p_gru);
+        XTime_GetTime(&end_argmax_time);
 
 
         if (pred_gru == yt) correct_gru++;
-
-
 
         cm_gru[yt][pred_gru]  += 1;
 
 
         // Optional progress print (reduce if UART is slow)
+        /*
         if ((n % 200) == 0) {
             printf("n=%d/%d\r", n, RR_N);
 
         }
+        */
+       t_gru = t_gru + (end_gru - start_gru);
+       t_para = t_para + (end_para_time - start_para_time);
+       t_argmax = t_argmax + (end_argmax_time - start_argmax_time);
     }
-    XTime_GetTime(&end_gru);
-    t_gru = (end_gru - start_gru);
+    //XTime_GetTime(&end_gru);
+    //t_gru = (end_gru - start_gru);
+    printf("parameter setting time: %llu \n", t_para);
+    printf("parameter setting seconds=%.6f\r\n", (double)t_para / (double)COUNTS_PER_SECOND);
     printf("gru time: %llu \n", t_gru);
     printf("GRU seconds=%.6f\r\n", (double)t_gru / (double)COUNTS_PER_SECOND);
+    printf("argmax time: %llu \n", t_argmax);
+    printf("argmax seconds=%.6f\r\n", (double)t_argmax / (double)COUNTS_PER_SECOND);
     // *********** GRU loop ************
 
 
-    // *********** LSTM loop ************
-    printf("start LSTM\n");
-    XTime_GetTime(&start_lstm);
-    for (int n = 0; n < RR_N; ++n) {
-        const float *x = rr_signal[n];  // 256 floats
-        int yt = (int)rr_label[n];      // 0..4
 
-        float p_lstm[NUM_CLASSES];
-
-
-
-        ecg_lstm(x, p_lstm);
-
-
-        int pred_lstm = argmax5(p_lstm);
-
-        if (pred_lstm == yt) correct_lstm++;
-
-
-
-        cm_lstm[yt][pred_lstm] += 1;
-
-        // Optional progress print (reduce if UART is slow)
-        if ((n % 200) == 0) {
-            printf("n=%d/%d\r", n, RR_N);
-
-        }
-    }
-    XTime_GetTime(&end_lstm);
-    t_lstm = (end_lstm - start_lstm);
-    printf("lstm time: %llu \n", t_lstm);
-    printf("LSTM seconds=%.6f\r\n", (double)t_lstm / (double)COUNTS_PER_SECOND);
-    // *********** LSTM loop ************
     printf("\n");
 
-    float acc_gru  = (float)correct_gru  / (float)RR_N;
-    float acc_lstm = (float)correct_lstm / (float)RR_N;
-    float agr      = (float)agree        / (float)RR_N;
+    float acc_gru  = (float)correct_gru  / (float)samples_count;
+
 
     // xil_printf doesn't support %f reliably on some BSPs.
     // Print as fixed-point (x10000) to be safe.
     int acc_gru_x1e4  = (int)(acc_gru  * 10000.0f + 0.5f);
-    int acc_lstm_x1e4 = (int)(acc_lstm * 10000.0f + 0.5f);
-    int agr_x1e4      = (int)(agr      * 10000.0f + 0.5f);
+
+
 
     printf("GRU acc : %d.%04d\n",  acc_gru_x1e4/10000,  acc_gru_x1e4%10000);
-    printf("LSTM acc: %d.%04d\n", acc_lstm_x1e4/10000, acc_lstm_x1e4%10000);
-    printf("Agreement: %d.%04d\n", agr_x1e4/10000,      agr_x1e4%10000);
 
-    print_confusion(cm_gru, "GRU");
-    print_confusion(cm_lstm, "LSTM");
+
+    //print_confusion(cm_gru, "GRU");
+
 
 
 
@@ -440,7 +418,7 @@ void ecg_lstm_and_gru() {
 
 
 void fourbyfour_sw(const uint64_t *in_u64, uint64_t *out_u64, int n_in) {
-    // 4 ±ø¦U¦Ûªº 16 ¯Å²¾¦ì¼È¦s¾¹
+    // 4 ï¿½ï¿½ï¿½Uï¿½Ûªï¿½ 16 ï¿½Å²ï¿½ï¿½ï¿½È¦sï¿½ï¿½
     int16_t a[4][16] = {0};
     int out_idx = 0;
 	int8_t c[4][16];
@@ -813,7 +791,7 @@ int main (void) {
 
     XTime t0, t1, t2, t3, t4;
     int sw_done = 0;
-    int repeat = 650;
+    int repeat = 700000;
 
 
 
@@ -831,15 +809,16 @@ int main (void) {
 
 	while(Xil_In32(XPAR_MYIP_0_S00_AXI_BASEADDR + 4) == 0) {
 		if (!sw_done) {
-			fourbyfour_sw(inputa, SoftwareOutput, 32);
-
-			sw_done = 1;   // ¥uºâ¤@¦¸¡]©Î©î¤p¶ô¦h¦¸ºâ¡^
+			//fourbyfour_sw(inputa, SoftwareOutput, 32);
+			ecg_lstm_and_gru();
+			sw_done = 1;
 		}
 	}
 	Xil_Out32(XPAR_MYIP_0_S00_AXI_BASEADDR, 0x00000000) ; // slv_reg0 = 0(no operation)
 
 
     XTime_GetTime(&t2);
+
     //fourbyfour_sw(inputa, SoftwareOutput, 32);
     int output_num = input_num -15;
     XTime_GetTime(&t3);
@@ -862,12 +841,13 @@ int main (void) {
 
     const u64 gticks2 = t2 - t1;
     const u64 us2     = (gticks2 * 1000000ULL) / COUNTS_PER_SECOND;
+    const u64 s2  = gticks2 / COUNTS_PER_SECOND;
     const u64 cycles2 = us2 * 50ULL;
 
 
     const u64 gticks3 = t3 - t2;
     const u64 us3     = (gticks3 * 1000000ULL) / COUNTS_PER_SECOND;
-    const u64 cycles3 = us3 * 50ULL;                                  // 20ns/clk ¡÷ 50 cycles/us
+    const u64 cycles3 = us3 * 50ULL;                                  // 20ns/clk ï¿½ï¿½ 50 cycles/us
 
     const u64 gticks4 = t4 - t3;
     const u64 us4     = (gticks4 * 1000000ULL) / COUNTS_PER_SECOND;
@@ -887,11 +867,12 @@ int main (void) {
     //printf("first DMA time(DMA counter):%d ticks\n",dma_tick1);
     printf("first DMA time(Xtime):%llu us\n",us1);
     printf("(%d rounds) hardware compute time: %llu cycles (~%llu us)\n",repeat, cycles2, us2);
+    printf("(%d rounds) hardware compute time: ~%llu second \n",repeat, s2);
     printf("software compute time: %llu cycles (~%llu us)\n", cycles3, us3);
     //printf("second DMA time: ~%.0f cycles @50MHz (~%.2f us, %d ticks)\n", dma_cycles_50_2, dma_us2, dma_tick2);
     //printf("second DMA time(DMA counter):%d ticks\n",dma_tick2);
     printf("second DMA time(Xtime):%llu us\n",us4);
     printf("total time: %llu cycles (~%llu us)\n", cycles5, us5);
-    ecg_lstm_and_gru();
+
     return 0;
 } // main()
